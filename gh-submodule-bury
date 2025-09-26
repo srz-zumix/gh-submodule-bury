@@ -1,0 +1,765 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+msg() {
+    echo >&2 -e "${1-}"
+}
+
+die() {
+    local msg=$1
+    local code=${2-1} # default exit status 1
+    msg "$msg"
+    exit "$code"
+}
+
+function usage() {
+    die "gh submodule-bury <submodule-path> [options]
+
+    Unlinks the specified submodule and adds its contents directly to the current repository.
+    
+    Options:
+      -f, --force      Force cleanup by resetting and removing uncommitted changes and ignored files
+      --no-verify      Disable verification of submodule file integrity after burying
+      -h, --help       Show this help message
+    
+    Examples:
+      gh submodule-bury path/to/submodule
+
+" "$1"
+}
+
+parse_params() {
+    SUBMODULE_PATH=""
+    FORCE=false
+    VERIFY=true
+    while :; do
+        case "${1-}" in
+
+        -h | --help)
+            usage 0
+            ;;
+        -f | --force)
+            FORCE=true
+            ;;
+        --no-verify)
+            VERIFY=false
+            ;;
+        --*| -* )
+            echo "${1:-} is invalid option."
+            usage 1
+            ;;
+        *)
+            if [ -z "${1:-}" ]; then
+                break
+            fi
+            if [ -n "${SUBMODULE_PATH}" ]; then
+                echo "${1:-} is invalid position option."
+                usage 1
+            fi
+            SUBMODULE_PATH="${1-}"
+            ;;
+        esac
+        shift
+    done
+    return 0
+}
+
+parse_params "$@"
+
+# Validate that we have a submodule path
+if [ -z "${SUBMODULE_PATH}" ]; then
+    echo "Error: Submodule path is required."
+    usage 1
+fi
+
+# Check if the path exists
+if [ ! -e "${SUBMODULE_PATH}" ]; then
+    die "Error: Path '${SUBMODULE_PATH}' does not exist."
+fi
+
+# Check if we're in a git repository
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    die "Error: Not in a git repository."
+fi
+
+# Function to check if a path is a git submodule
+is_submodule() {
+    local path="$1"
+    # Check if the path is listed in .gitmodules
+    if [ -f ".gitmodules" ] && git config -f .gitmodules --get-regexp "submodule\..*\.path" | grep -q "^submodule\..*\.path ${path}$"; then
+        return 0
+    fi
+    return 1
+}
+
+# Function to get submodule info
+get_submodule_info() {
+    local path="$1"
+    local name
+    local url
+    local commit
+    
+    name=$(git config -f .gitmodules --get-regexp "submodule\..*\.path" | grep "^submodule\..*\.path ${path}$" | sed 's/^submodule\.\(.*\)\.path .*/\1/')
+    url=$(git config -f .gitmodules "submodule.${name}.url")
+    
+    # Check if submodule is initialized (has .git file or directory)
+    if [ -e "${path}/.git" ]; then
+        commit=$(git -C "${path}" rev-parse HEAD 2>/dev/null || echo "unknown")
+    else
+        commit="unknown"
+    fi
+    
+    echo "name:${name}"
+    echo "url:${url}"
+    echo "commit:${commit}"
+}
+
+# Function to check if a submodule is properly initialized
+is_submodule_initialized() {
+    local path="$1"
+    
+    # Check if the path exists
+    if [ ! -d "${path}" ]; then
+        return 1
+    fi
+    
+    # Check if .git exists (can be file or directory)
+    if [ ! -e "${path}/.git" ]; then
+        return 1
+    fi
+    
+    # Try to run a git command to verify it's a valid git repository
+    if ! git -C "${path}" rev-parse --git-dir > /dev/null 2>&1; then
+        return 1
+    fi
+    
+    # Check if the submodule has any commits (not just an empty repository)
+    if ! git -C "${path}" rev-parse HEAD > /dev/null 2>&1; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# Function to check for ignored files that would be lost
+check_ignored_files() {
+    local path="$1"
+    local context_name="$2"  # e.g., "Submodule" or "Nested submodule"
+    local ignored_files
+    
+    # Get list of ignored files that actually exist
+    if ignored_files=$(git -C "${path}" ls-files --others --ignored --exclude-standard 2>/dev/null); then
+        if [ -n "${ignored_files}" ]; then
+            if [ "${FORCE}" = "true" ]; then
+                msg "Warning: ${context_name} '${path}' contains .gitignore'd files, force removing..."
+                
+                # Show what will be removed
+                while IFS= read -r file_path; do
+                    msg "  Will remove ignored: ${file_path}"
+                done <<< "${ignored_files}"
+                
+                # Remove ignored files
+                if ! git -C "${path}" clean -fdX 2>/dev/null; then
+                    msg "Error: Failed to remove ignored files in ${context_name,,} '${path}'."
+                    return 1
+                fi
+                
+                msg "✓ Removed ignored files from ${context_name,,} '${path}'"
+            else
+                msg "Error: ${context_name} '${path}' contains .gitignore'd files that would be lost:"
+                
+                # Show the ignored files
+                while IFS= read -r file_path; do
+                    msg "  Ignored: ${file_path}"
+                done <<< "${ignored_files}"
+                
+                msg ""
+                msg "These files are ignored by .gitignore but exist in the filesystem."
+                msg "When burying the submodule, these files would be copied to the parent repository"
+                msg "where they might not be ignored anymore, potentially causing issues."
+                msg ""
+                msg "Please resolve this by either:"
+                if [ "${context_name}" = "Submodule" ]; then
+                    msg "1. Remove the ignored files: cd ${path} && git clean -fdX"
+                    msg "2. Or commit them if they should be tracked: cd ${path} && git add -f <files> && git commit"
+                    msg "3. Or add them to parent repository's .gitignore before burying"
+                    msg "4. Use --force to automatically remove ignored files"
+                else
+                    msg "1. Remove the ignored files: cd ${path} && git clean -fdX"
+                    msg "2. Or commit them if they should be tracked: cd ${path} && git add -f <files> && git commit"
+                    msg "3. Use --force to automatically remove ignored files"
+                fi
+                return 1  # Indicate that there are ignored files
+            fi
+        fi
+    fi
+    return 0  # No ignored files found
+}
+
+# Function to force cleanup a submodule to meet requirements
+force_cleanup_submodule() {
+    local path="$1"
+    local context_name="$2"  # e.g., "Submodule" or "Nested submodule"
+    
+    msg "Force cleaning ${context_name,,} '${path}'..."
+    
+    # Reset any staged and unstaged changes
+    if ! git -C "${path}" reset --hard HEAD 2>/dev/null; then
+        msg "Warning: Failed to reset ${context_name,,} '${path}'. It might not be initialized properly."
+        return 1
+    fi
+    
+    # Remove untracked files and directories
+    if ! git -C "${path}" clean -fd 2>/dev/null; then
+        msg "Warning: Failed to clean untracked files in ${context_name,,} '${path}'."
+        return 1
+    fi
+    
+    # Remove ignored files and directories
+    if ! git -C "${path}" clean -fdX 2>/dev/null; then
+        msg "Warning: Failed to clean ignored files in ${context_name,,} '${path}'."
+        return 1
+    fi
+    
+    msg "✓ Force cleaned ${context_name,,} '${path}'"
+    return 0
+}
+
+# Function to check git status and show detailed information
+check_git_status_detailed() {
+    local path="$1"
+    local context_name="$2"  # e.g., "Submodule" or "Nested submodule"
+    local git_status
+    
+    if ! git_status=$(git -C "${path}" status --porcelain 2>/dev/null); then
+        die "Error: Failed to check git status in ${context_name,,} '${path}'."
+    fi
+    
+    if [ -n "${git_status}" ]; then
+        if [ "${FORCE}" = "true" ]; then
+            msg "Warning: ${context_name} '${path}' has uncommitted changes or untracked files, force cleaning..."
+            
+            # Show what will be cleaned
+            while IFS= read -r line; do
+                local status_code="${line:0:2}"
+                local file_path="${line:3}"
+                case "${status_code}" in
+                    "??") msg "  Will remove untracked: ${file_path}" ;;
+                    " M") msg "  Will reset modified: ${file_path}" ;;
+                    "M ") msg "  Will reset staged: ${file_path}" ;;
+                    "MM") msg "  Will reset: ${file_path}" ;;
+                    "A ") msg "  Will reset added: ${file_path}" ;;
+                    "D ") msg "  Will reset deleted: ${file_path}" ;;
+                    " D") msg "  Will reset deleted: ${file_path}" ;;
+                    "R ") msg "  Will reset renamed: ${file_path}" ;;
+                    "C ") msg "  Will reset copied: ${file_path}" ;;
+                    *) msg "  Will reset ${status_code}: ${file_path}" ;;
+                esac
+            done <<< "${git_status}"
+            
+            # Perform force cleanup
+            if ! force_cleanup_submodule "${path}" "${context_name}"; then
+                return 1
+            fi
+        else
+            msg "Error: ${context_name} '${path}' has uncommitted changes or untracked files:"
+            
+            # Show detailed status
+            while IFS= read -r line; do
+                local status_code="${line:0:2}"
+                local file_path="${line:3}"
+                case "${status_code}" in
+                    "??") msg "  Untracked: ${file_path}" ;;
+                    " M") msg "  Modified (unstaged): ${file_path}" ;;
+                    "M ") msg "  Modified (staged): ${file_path}" ;;
+                    "MM") msg "  Modified (staged and unstaged): ${file_path}" ;;
+                    "A ") msg "  Added: ${file_path}" ;;
+                    "D ") msg "  Deleted (staged): ${file_path}" ;;
+                    " D") msg "  Deleted (unstaged): ${file_path}" ;;
+                    "R ") msg "  Renamed: ${file_path}" ;;
+                    "C ") msg "  Copied: ${file_path}" ;;
+                    *) msg "  ${status_code}: ${file_path}" ;;
+                esac
+            done <<< "${git_status}"
+            
+            msg ""
+            if [ "${context_name}" = "Submodule" ]; then
+                msg "Please resolve these changes before burying the submodule:"
+                msg "1. Commit your changes: git -C ${path} add . && git -C ${path} commit -m 'Your message'"
+                msg "2. Or discard changes: git -C ${path} reset --hard && git -C ${path} clean -fd"
+                msg "3. Use --force to automatically discard changes"
+                msg "4. Then run this command again"
+            else
+                msg "Please resolve changes in nested submodule:"
+                msg "git -C ${path} add . && git -C ${path} commit -m 'Your message'"
+                msg "Or discard: git -C ${path} reset --hard && git -C ${path} clean -fd)"
+                msg "Or use --force to automatically discard changes"
+            fi
+            return 1  # Indicate that there are changes
+        fi
+    fi
+    return 0  # Clean status
+}
+
+# Function to check nested submodules recursively
+check_nested_submodules() {
+    local parent_path="$1"
+    local nested_submodules
+    
+    msg "Checking for nested submodules..."
+    if nested_submodules=$(git -C "${parent_path}" submodule status 2>/dev/null); then
+        if [ -n "${nested_submodules}" ]; then
+            msg "Found nested submodules:"
+            echo "${nested_submodules}" | while IFS= read -r submodule_line; do
+                # Parse submodule status line (format: " commit_hash path (tag)" or "-commit_hash path" etc.)
+                local status_char="${submodule_line:0:1}"
+                local nested_path=$(echo "${submodule_line}" | awk '{print $2}')
+                local nested_full_path="${parent_path}/${nested_path}"
+                
+                case "${status_char}" in
+                    " ") msg "  ✓ ${nested_path} (initialized and clean)" ;;
+                    "-") msg "  - ${nested_path} (not initialized)"
+                         msg "    Error: Nested submodule is not initialized"
+                         msg "    Please initialize nested submodules first:"
+                         msg "    git submodule update --init --recursive \"${parent_path}\""
+                         die "Nested submodule '${nested_path}' is not initialized."
+                         ;;
+                    "+") msg "  + ${nested_path} (checked out commit differs from index)" 
+                         msg "    Warning: Nested submodule has uncommitted changes"
+                         ;;
+                    "U") msg "  U ${nested_path} (merge conflicts)" 
+                         msg "    Error: Nested submodule has merge conflicts"
+                         die "Nested submodule '${nested_path}' has merge conflicts. Please resolve before continuing."
+                         ;;
+                    *) msg "  ${status_char} ${nested_path} (unknown status)" ;;
+                esac
+                
+                # Recursively check nested submodule's git status if it's initialized
+                if [ "${status_char}" = " " ] || [ "${status_char}" = "+" ]; then
+                    if ! is_submodule_initialized "${nested_full_path}"; then
+                        msg "    Error: Nested submodule '${nested_path}' appears initialized but validation failed"
+                        msg "    This might indicate a corrupted submodule or missing commits"
+                        msg "    Please reinitialize: git submodule update --init \"${parent_path}/${nested_path}\""
+                        die "Nested submodule '${nested_path}' failed initialization validation."
+                    fi
+                    
+                    if ! check_git_status_detailed "${nested_full_path}" "Nested submodule"; then
+                        die "Nested submodule '${nested_path}' has uncommitted changes or untracked files."
+                    fi
+                    
+                    if ! check_ignored_files "${nested_full_path}" "Nested submodule"; then
+                        die "Nested submodule '${nested_path}' contains .gitignore'd files."
+                    fi
+                    
+                    if ! check_git_lfs_status "${nested_full_path}" "Nested submodule"; then
+                        die "Nested submodule '${nested_path}' has unpulled Git LFS files."
+                    fi
+                fi
+            done
+            msg "✓ All nested submodules are clean"
+        else
+            msg "✓ No nested submodules found"
+        fi
+    else
+        msg "✓ No nested submodules found"
+    fi
+}
+
+# Function to remove nested submodules from git cache
+remove_nested_submodules_from_cache() {
+    local parent_path="$1"
+    local nested_submodules
+    
+    msg "Removing nested submodules from git cache..."
+    if nested_submodules=$(git -C "${parent_path}" submodule status 2>/dev/null); then
+        if [ -n "${nested_submodules}" ]; then
+            echo "${nested_submodules}" | while IFS= read -r submodule_line; do
+                # Parse submodule status line to get the path
+                local nested_path=$(echo "${submodule_line}" | awk '{print $2}')
+                local nested_full_path="${parent_path}/${nested_path}"
+                
+                # Remove nested submodule from git cache
+                if git rm --cached "${nested_full_path}" >/dev/null 2>&1; then
+                    msg "✓ Removed nested submodule from cache: ${nested_path}"
+                else
+                    msg "Note: Nested submodule '${nested_path}' was already removed from cache or not cached"
+                fi
+                
+                # Recursively handle deeply nested submodules
+                if [ -d "${nested_full_path}" ]; then
+                    remove_nested_submodules_from_cache "${nested_full_path}"
+                fi
+            done
+        fi
+    fi
+}
+
+# Function to check if Git LFS files are properly pulled
+check_git_lfs_status() {
+    local path="$1"
+    local context_name="$2"  # e.g., "Submodule" or "Nested submodule"
+    
+    # Check if git lfs is available
+    if ! command -v git-lfs >/dev/null 2>&1; then
+        # Git LFS not installed, skip check
+        return 0
+    fi
+    
+    # Check if the repository uses Git LFS
+    if [ ! -f "${path}/.gitattributes" ] && ! git -C "${path}" config --get-regexp "filter\.lfs" >/dev/null 2>&1; then
+        # No LFS configuration found, skip check
+        return 0
+    fi
+    
+    msg "Checking Git LFS status in ${context_name,,}..."
+    
+    # Get list of LFS files that are not properly pulled (pointer files)
+    local lfs_status
+    if lfs_status=$(git -C "${path}" lfs status 2>/dev/null); then
+        # Check for unpulled LFS files (files that exist as pointers)
+        local unpulled_files
+        if unpulled_files=$(git -C "${path}" lfs ls-files --not-present 2>/dev/null); then
+            if [ -n "${unpulled_files}" ]; then
+                if [ "${FORCE}" = "true" ]; then
+                    msg "Warning: ${context_name} '${path}' has unpulled Git LFS files, attempting to pull..."
+                    
+                    # Show what will be pulled
+                    while IFS= read -r lfs_file; do
+                        msg "  Will pull LFS file: ${lfs_file}"
+                    done <<< "${unpulled_files}"
+                    
+                    # Try to pull LFS files
+                    if git -C "${path}" lfs pull >/dev/null 2>&1; then
+                        msg "✓ Successfully pulled Git LFS files in ${context_name,,} '${path}'"
+                    else
+                        msg "Warning: Failed to pull some Git LFS files in ${context_name,,} '${path}'"
+                        msg "You may need to run: git -C ${path} lfs pull"
+                        return 1
+                    fi
+                else
+                    msg "Error: ${context_name} '${path}' has unpulled Git LFS files:"
+                    
+                    # Show the unpulled LFS files
+                    while IFS= read -r lfs_file; do
+                        msg "  LFS file not pulled: ${lfs_file}"
+                    done <<< "${unpulled_files}"
+                    
+                    msg ""
+                    msg "Git LFS files exist as pointer files and haven't been downloaded."
+                    msg "When burying the submodule, only the pointer files would be copied,"
+                    msg "not the actual large file content."
+                    msg ""
+                    msg "Please resolve this by either:"
+                    msg "1. Pull LFS files: cd ${path} && git lfs pull"
+                    msg "2. Use --force to automatically attempt to pull LFS files"
+                    return 1
+                fi
+            fi
+        fi
+    fi
+    
+    msg "✓ Git LFS files are properly pulled in ${context_name,,}"
+    return 0
+}
+
+# Function to get file hash considering Git LFS
+get_file_content_hash() {
+    local file_path="$1"
+    git hash-object "${file_path}" 2>/dev/null
+}
+
+# Function to get git tracked files with their hashes
+get_git_file_hashes() {
+    local path="$1"
+    local output_file="$2"
+    
+    if [ -d "${path}" ]; then
+        # Get all git tracked files with their content hashes (excluding .gitmodules and .git directories)
+        # Use git ls-files to get all tracked files, including those that might be ignored by .gitignore
+        # Format: hash filename
+        git -C "${path}" ls-files --recurse-submodules | while IFS= read -r file; do
+            # Skip .gitmodules files and check if file actually exists
+            if [ "$(basename ${file})" != ".gitmodules" ] && [ -f "${path}/${file}" ]; then
+                local hash=$(get_file_content_hash "${path}/${file}")
+                if [ -n "${hash}" ]; then
+                    echo "${hash} ${file}"
+                fi
+            fi
+        done | sort > "${output_file}" 2>/dev/null || touch "${output_file}"
+    else
+        touch "${output_file}"
+    fi
+}
+
+
+
+# Function to verify committed content integrity against original submodule
+verify_committed_content_integrity() {
+    local submodule_path="$1"
+    local verification_dir="$2"
+    
+    msg "Verifying final committed content against original git hashes..."
+    local original_hashes="${verification_dir}/original_git_hashes.txt"
+    local committed_hashes="${verification_dir}/committed_git_hashes.txt"
+    
+    # Get hashes of files now committed in the git repository
+    if [ -d "${submodule_path}" ]; then
+        git ls-files --exclude-standard "${submodule_path}" | while IFS= read -r file; do
+            # Skip .gitmodules files
+            if [[ "${file}" != *".gitmodules" ]] && [ -f "${file}" ]; then
+                local hash=$(get_file_content_hash "${file}")
+                local rel_path=$(echo "${file}" | sed "s|^${submodule_path}/||")
+                if [ -n "${hash}" ] && [ -n "${rel_path}" ]; then
+                    echo "${hash} ${rel_path}"
+                fi
+            fi
+        done | sort > "${committed_hashes}" 2>/dev/null || touch "${committed_hashes}"
+    else
+        touch "${committed_hashes}"
+    fi
+    
+    # Compare original and committed hashes
+    if ! diff "${original_hashes}" "${committed_hashes}" >/dev/null 2>&1; then
+        msg "Error: Final git content verification failed!"
+        msg "Original submodule files vs Committed files:"
+        diff "${original_hashes}" "${committed_hashes}" 2>/dev/null || true
+        return 1
+    fi
+    
+    local verified_count=$(wc -l < "${committed_hashes}" 2>/dev/null || echo "0")
+    msg "✓ Final content integrity verified: ${verified_count} committed files with matching git hashes"
+    
+    return 0
+}
+
+# Function to validate submodule requirements
+validate_submodule_requirements() {
+    local submodule_path="$1"
+    
+    msg "Checking submodule git status..."
+    if ! is_submodule_initialized "${submodule_path}"; then
+        msg "Error: Submodule '${submodule_path}' is not properly initialized"
+        msg "This might indicate the submodule was not initialized with 'git submodule init' and 'git submodule update'"
+        msg ""
+        msg "Please initialize the submodule first:"
+        msg "  git submodule update --init \"${submodule_path}\""
+        msg ""
+        msg "Or if you want to initialize all submodules:"
+        msg "  git submodule update --init --recursive"
+        die "Submodule is not initialized."
+    fi
+    
+    # Check main submodule status
+    if ! check_git_status_detailed "${submodule_path}" "Submodule"; then
+        die "Submodule has uncommitted changes or untracked files."
+    fi
+    
+    msg "✓ Submodule has a clean working directory"
+    
+    # Check for ignored files that would be lost
+    if ! check_ignored_files "${submodule_path}" "Submodule"; then
+        die "Submodule contains .gitignore'd files."
+    fi
+    
+    msg "✓ Submodule has no problematic ignored files"
+    
+    # Check Git LFS status
+    if ! check_git_lfs_status "${submodule_path}" "Submodule"; then
+        die "Submodule has unpulled Git LFS files."
+    fi
+    
+    msg "✓ Submodule Git LFS files are properly pulled"
+    
+    # Check nested submodules
+    check_nested_submodules "${submodule_path}"
+}
+
+# Function to bury the submodule
+bury_submodule() {
+    local submodule_path="$1"
+    local temp_dir
+    local submodule_name
+    local submodule_url
+    local submodule_commit
+    
+    msg "Burying submodule: ${submodule_path}"
+    
+    # Get submodule information
+    local info
+    info=$(get_submodule_info "${submodule_path}")
+    submodule_name=$(echo "${info}" | grep "^name:" | cut -d: -f2)
+    submodule_url=$(echo "${info}" | grep "^url:" | cut -d: -f2-)
+    submodule_commit=$(echo "${info}" | grep "^commit:" | cut -d: -f2)
+    
+    msg "Submodule info:"
+    msg "  Name: ${submodule_name}"
+    msg "  URL: ${submodule_url}"
+    msg "  Commit: ${submodule_commit}"
+    
+    # Validate submodule requirements (clean status, no nested issues)
+    validate_submodule_requirements "${submodule_path}"
+    
+    # Create temporary directory with subdirectories for backup and verification
+    temp_dir=$(mktemp -d)
+    local backup_dir="${temp_dir}/backup"
+    local verification_dir="${temp_dir}/verification"
+    mkdir -p "${backup_dir}" "${verification_dir}"
+    msg "Creating temporary workspace in: ${temp_dir}"
+    msg "  Backup directory: ${backup_dir}"
+    msg "  Verification directory: ${verification_dir}"
+    
+    # Save original git file hashes for later verification
+    if [ "${VERIFY}" = "true" ]; then
+        msg "Verification enabled: Will verify final content integrity after burying"
+
+        msg "Capturing original git file hashes for verification..."
+        local original_hashes="${verification_dir}/original_git_hashes.txt"
+        get_git_file_hashes "${submodule_path}" "${original_hashes}"
+        local git_files_count=$(wc -l < "${original_hashes}" 2>/dev/null || echo "0")
+        msg "✓ Captured hashes for ${git_files_count} git-tracked files"
+    else
+        msg "Verification disabled: Skipping final content integrity verification"
+    fi
+    
+    # Copy submodule contents to backup directory (excluding .git)
+    # Use -P to preserve symbolic links instead of following them
+    if [ -d "${submodule_path}" ]; then
+        cp -rP "${submodule_path}/." "${backup_dir}/"
+        # Remove .git directory from backup
+        rm -rf "${backup_dir}/.git"
+        
+        # Verify backup by checking file count
+        local backup_files_count=$(find "${backup_dir}" -type f -not -path "${backup_dir}/.git*" | wc -l 2>/dev/null || echo "0")
+        msg "✓ Backup created: ${backup_files_count} files copied"
+    else
+        die "Error: Submodule directory '${submodule_path}' not found."
+    fi
+    
+    # Remove nested submodules from git cache first
+    remove_nested_submodules_from_cache "${submodule_path}"
+    
+    # Deinitialize the submodule
+    msg "Deinitializing submodule..."
+    if ! git submodule deinit -f "${submodule_path}"; then
+        rm -rf "${temp_dir}"
+        die "Error: Failed to deinitialize submodule '${submodule_path}'."
+    fi
+    
+    # Remove submodule from git cache to ensure clean removal
+    msg "Removing submodule from git cache..."
+    if git rm --cached "${submodule_path}" >/dev/null 2>&1; then
+        msg "✓ Removed submodule from git cache"
+    else
+        msg "Note: Submodule was already removed from cache or not cached"
+    fi
+    
+    # Remove the submodule directory if it still exists
+    msg "Ensuring submodule directory is removed..."
+    if [ -d "${submodule_path}" ]; then
+        if ! git rm -r "${submodule_path}" 2>/dev/null; then
+            # If git rm fails, the path might already be removed from index
+            # Just remove the directory physically
+            rm -rf "${submodule_path}"
+            msg "✓ Removed submodule directory"
+        else
+            msg "✓ Removed submodule from git index and filesystem"
+        fi
+    fi
+    
+    # Remove submodule section from .gitmodules
+    if [ -f ".gitmodules" ]; then
+        git config -f .gitmodules --remove-section "submodule.${submodule_name}" 2>/dev/null || true
+        # If .gitmodules is now empty, remove it
+        if [ ! -s ".gitmodules" ]; then
+            git rm .gitmodules
+        else
+            git add .gitmodules
+        fi
+    fi
+    
+    # Commit the submodule removal (first commit)
+    msg "Committing submodule removal..."
+    commit_msg_remove="Remove submodule ${submodule_path}
+
+- Deinitialize submodule: ${submodule_path}
+- Remove from .gitmodules
+- Original URL: ${submodule_url}
+- Original commit: ${submodule_commit}"
+    
+    if ! git commit -m "${commit_msg_remove}"; then
+        rm -rf "${temp_dir}"
+        die "Error: Failed to commit submodule removal."
+    fi
+    
+    msg "✓ First commit completed: Submodule removal"
+    
+    # Create the directory and add the contents back
+    msg "Adding submodule contents to repository..."
+    mkdir -p "${submodule_path}"
+    # Use -P to preserve symbolic links instead of following them
+    cp -rP "${backup_dir}/." "${submodule_path}/"
+    
+    # Remove nested .gitmodules files to prevent submodule conflicts
+    msg "Removing nested .gitmodules files..."
+    find "${submodule_path}" -name ".gitmodules" -type f -exec rm -f {} \; 2>/dev/null || true
+    
+    # Remove nested .git directories and files to clean up submodule artifacts
+    msg "Removing nested .git directories and files..."
+    find "${submodule_path}" -name ".git" \( -type d -o -type f \) -exec rm -rf {} \; 2>/dev/null || true
+    
+    # Add the new contents to git
+    git add -f "${submodule_path}"
+    
+    # Commit the file addition (second commit)
+    msg "Committing submodule contents as regular files..."
+    commit_msg_add="Add contents from former submodule ${submodule_path}
+
+- Add all files from submodule as regular repository files
+- Former submodule URL: ${submodule_url}
+- Former submodule commit: ${submodule_commit}"
+    
+    if ! git commit -m "${commit_msg_add}"; then
+        rm -rf "${temp_dir}"
+        die "Error: Failed to commit submodule contents."
+    fi
+    
+    msg "✓ Second commit completed: Contents addition"
+    
+    if [ "${VERIFY}" = "true" ]; then
+        # Verify final committed content integrity against original git tracked files
+        if ! verify_committed_content_integrity "${submodule_path}" "${verification_dir}"; then
+            echo rm -rf "${temp_dir}"
+            die "Error: Final content verification failed. Committed git content hashes do not match original."
+        fi
+    fi
+    
+    # Clean up temporary directory
+    rm -rf "${temp_dir}"
+    
+    msg ""
+    msg "🎉 Submodule '${submodule_path}' has been successfully buried!"
+    msg ""
+    msg "Two commits have been created:"
+    msg "1. Submodule removal commit"
+    msg "2. Contents addition commit"
+    msg ""
+    msg "Original submodule info (for reference):"
+    msg "  URL: ${submodule_url}"
+    msg "  Commit: ${submodule_commit}"
+    msg ""
+    msg "You can review the commits with:"
+    msg "  git log --oneline -2"
+}
+
+# Main execution
+msg "Starting submodule bury process for: ${SUBMODULE_PATH}"
+
+# Check if the specified path is a submodule
+if ! is_submodule "${SUBMODULE_PATH}"; then
+    die "Error: '${SUBMODULE_PATH}' is not a git submodule."
+fi
+
+# Execute the bury process
+bury_submodule "${SUBMODULE_PATH}"
+
+msg "Submodule bury process completed successfully!"
