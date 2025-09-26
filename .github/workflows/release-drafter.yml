@@ -39,5 +39,7 @@ jobs:
   update_semver:
     needs: publish_release
     uses: ./.github/workflows/update_semver.yml
+    permissions:
+      contents: write
     with:
       tag: ${{ needs.publish_release.outputs.tag_name }}
