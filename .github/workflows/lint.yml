@@ -22,7 +22,7 @@ jobs:
           path: "."
           pattern: |
             *.sh
-            gh-pr-ls-files
+            gh-submodule-bury
           exclude: "./.git/*"
 
   actionlint:
